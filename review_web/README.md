@@ -34,3 +34,9 @@ O desktop fica vinculado ao endereço configurado para aquele conjunto de teste.
 ## Verificação local
 
 Execute `runtime\python.exe -m unittest discover -s tests -p test_review_web_pilot.py` na raiz do AlphaDive. O teste usa uma pasta JSON local para a fila web, simula a resposta do Google e verifica a gravação no Excel fictício. As credenciais de publicação e o teste em aparelhos móveis fazem parte do aceite da implantação.
+
+## Primeiro teste operacional
+
+Na instalação desktop, use `runtime\python.exe -m tools.review_operational <pasta-do-piloto> <banco-local> <planilha> --preview recortes.png` para preparar a cópia de teste e conferir os recortes localmente. O primeiro lote aceita até cinco grupos de horários e três células numéricas vinculadas à sua origem. Cada tarefa usa um identificador opaco e contém apenas os recortes selecionados e rótulos genéricos.
+
+Para publicar o lote conferido e autorizado, habilite `REVIEW_OPERATIONAL_ENABLED=1` no serviço e execute o mesmo comando com `--publish-to https://<endereço-do-piloto>`. Abra **Teste operacional** na fila web. A seção **Revisão web** do AlphaDive indica a cópia de destino. O julgamento dos horários é registrado no histórico local do teste. As correções numéricas são aplicadas na cópia quando a origem, o recorte e a célula conferem.

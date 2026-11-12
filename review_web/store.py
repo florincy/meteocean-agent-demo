@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from .protocol import canonical
+from .protocol import canonical, checksum, crop_png
 
 
 DRIVE_FILES = "https://www.googleapis.com/drive/v3/files"
@@ -41,6 +41,19 @@ class LocalJournal:
         temporary.write_text(canonical(event), encoding="utf-8")
         temporary.replace(destination)
 
+    def store_crop(self, digest, data):
+        directory = self.path / "crops"
+        directory.mkdir(exist_ok=True)
+        destination = directory / f"{digest}.png"
+        if not destination.exists():
+            temporary = destination.with_suffix(f".{uuid4().hex}.tmp")
+            temporary.write_bytes(data)
+            temporary.replace(destination)
+
+    def read_crop(self, digest):
+        path = self.path / "crops" / f"{digest}.png"
+        return path.read_bytes() if path.is_file() else None
+
 
 class DriveJournal:
     def __init__(self, folder, client_id, client_secret, refresh_token):
@@ -50,9 +63,10 @@ class DriveJournal:
         self.token = ""
         self.expires = 0
         self.recent = {}
+        self.crop_ids = {}
         self.client = httpx.Client(timeout=15)
 
-    def request(self, method, url, **kwargs):
+    def request(self, method, url, *, media=False, **kwargs):
         for attempt in range(2):
             if monotonic() >= self.expires:
                 response = self.client.post("https://oauth2.googleapis.com/token", data=self.credentials)
@@ -62,7 +76,8 @@ class DriveJournal:
             headers = kwargs.get("headers", {}) | {"Authorization": "Bearer " + self.token}
             response = self.client.request(method, url, **(kwargs | {"headers": headers}))
             if response.status_code != 401 or attempt:
-                return response.raise_for_status().json()
+                response.raise_for_status()
+                return response.content if media else response.json()
             self.expires = 0
 
     def initialize(self):
@@ -93,18 +108,43 @@ class DriveJournal:
 
     def append(self, event):
         content = canonical(event)
-        metadata = canonical(dict(name=f"{event['kind']}-{event['id']}.json",
-                                  parents=[self.folder], description=content,
-                                  mimeType="application/json", appProperties={"app": DRIVE_TAG}))
+        metadata = dict(name=f"{event['kind']}-{event['id']}.json", description=content,
+                        mimeType="application/json", appProperties={"app": DRIVE_TAG})
+        self.recent[self.upload(metadata, content.encode("utf-8"))] = event
+
+    def upload(self, metadata, data):
         boundary = uuid4().hex
+        properties = canonical(dict(metadata, parents=[self.folder]))
         body = (
-            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n"
-            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{content}\r\n"
-            f"--{boundary}--\r\n"
-        ).encode("utf-8")
+            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{properties}\r\n"
+            f"--{boundary}\r\nContent-Type: {metadata['mimeType']}\r\n\r\n"
+        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("ascii")
         record = self.request("POST", DRIVE_UPLOAD, params={"uploadType": "multipart", "fields": "id"},
                               headers={"Content-Type": f"multipart/related; boundary={boundary}"}, content=body)
-        self.recent[record["id"]] = event
+        return record["id"]
+
+    def crop_id(self, digest):
+        if digest not in self.crop_ids:
+            found = self.request("GET", DRIVE_FILES, params={
+                "q": f"'{self.folder}' in parents and trashed=false and "
+                     f"appProperties has {{ key='review_crop' and value='{digest}' }}",
+                "fields": "files(id)", "pageSize": 10,
+            })
+            ids = [file["id"] for file in found.get("files", [])]
+            if ids:
+                self.crop_ids[digest] = min(ids)
+        return self.crop_ids.get(digest)
+
+    def store_crop(self, digest, data):
+        if not self.crop_id(digest):
+            self.crop_ids[digest] = self.upload(dict(name=f"recorte-{digest}.png", mimeType="image/png",
+                                                     appProperties={"review_crop": digest}), data)
+
+    def read_crop(self, digest):
+        key = self.crop_id(digest)
+        if key:
+            return self.request("GET", f"{DRIVE_FILES}/{key}", params={"alt": "media"}, media=True)
+        return None
 
 
 class ReviewStore:
@@ -146,18 +186,37 @@ class ReviewStore:
     def record(self, kind, key, data):
         self.journal.append(dict(kind=kind, id=key, data=data, at=timestamp()))
 
-    def publish(self, task):
+    def publish(self, task, crops=None):
         with self.lock:
             tasks, _ = self.state()
             previous = tasks.get(task["id"])
             if previous is None:
+                if task.get("scope") == "operational":
+                    limit = 5 if task["kind"] == "time" else 3
+                    if sum(item.get("scope") == "operational" and item["kind"] == task["kind"]
+                           for item in tasks.values()) >= limit:
+                        raise Conflict("O primeiro lote operacional já está completo.")
+                    for digest, data in crops.items():
+                        self.journal.store_crop(digest, data)
                 self.record("task", task["id"], task)
             elif previous["version"] != task["version"]:
                 raise Conflict("A tarefa tem outra versão publicada.")
 
     def image(self, digest):
-        # The only images accepted by the pilot are the bundled synthetic crops.
-        return self.images.get(digest)
+        if digest in self.images:
+            return self.images[digest]
+        with self.lock:
+            tasks, _ = self.state()
+            if any(card["crop"] == digest for task in tasks.values() for card in task["cards"]):
+                data = self.journal.read_crop(digest)
+                if data and crop_png(data) and checksum(data) == digest:
+                    return data
+        return None
+
+    def task(self, key):
+        with self.lock:
+            tasks, _ = self.state()
+            return tasks.get(key)
 
     def tasks(self):
         with self.lock:
@@ -209,4 +268,3 @@ class ReviewStore:
             if not previous or previous["status"] not in {"SAVED", "WAITING_EXCEL"}:
                 raise Conflict("Revisão inexistente ou já encerrada com outro resultado.")
             self.record("ack", operation, result)
-

@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from itsdangerous import BadData, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from .protocol import API, checksum, pilot_fixture, validate_entries
+from .protocol import API, MAX_CROP, NUMERIC_CELLS, checksum, crop_png, operational_task, pilot_fixture, validate_entries
 from .store import Conflict, DriveJournal, LocalJournal, ReviewStore
 
 
@@ -39,6 +39,7 @@ class Settings:
     reviewers: dict
     drive_folder: str = ""
     drive_refresh_token: str = ""
+    operational_enabled: bool = False
 
     @classmethod
     def from_env(cls):
@@ -52,6 +53,7 @@ class Settings:
             json.loads(os.environ.get("REVIEW_GOOGLE_REVIEWERS", "{}")),
             os.environ.get("REVIEW_DRIVE_FOLDER_ID", ""),
             os.environ.get("REVIEW_DRIVE_REFRESH_TOKEN", ""),
+            os.environ.get("REVIEW_OPERATIONAL_ENABLED") == "1",
         )
 
     def validate(self):
@@ -85,9 +87,23 @@ class Payload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class OperationalCard(Payload):
+    id: Literal["m1", "m2", "cell"]
+    crop: Digest
+    value: Annotated[str, StringConstraints(max_length=16, pattern=r"^[0-9:., ]*$")] = ""
+
+
+class OperationalSpec(Payload):
+    kind: Literal["time", "cell"]
+    field: Literal["Inicio", "Fim", "Profundidade_Max_m", "Tempo_Fundo_min"]
+    number: int = Field(ge=1, le=8)
+    cards: list[OperationalCard] = Field(min_length=1, max_length=2)
+
+
 class Publish(Payload):
     version: Digest
-    crops: dict[Digest, Annotated[str, StringConstraints(max_length=32768)]] = Field(max_length=2)
+    crops: dict[Digest, Annotated[str, StringConstraints(max_length=(MAX_CROP + 2) // 3 * 4)]] = Field(max_length=2)
+    operational: OperationalSpec | None = None
 
 
 class Entry(Payload):
@@ -189,7 +205,7 @@ def create_app(settings=None):
                 size = int(request.headers.get("content-length", "-1"))
             except ValueError:
                 size = -1
-            if not 0 <= size <= 80_000 or request.headers.get("transfer-encoding"):
+            if not 0 <= size <= 450_000 or request.headers.get("transfer-encoding"):
                 return JSONResponse({"detail": "Envio excede o limite do piloto."}, status_code=413)
         response = await next_handler(request)
         response.headers["Cache-Control"] = "no-store"
@@ -276,11 +292,14 @@ def create_app(settings=None):
     @service.get(API + "/tasks")
     def list_tasks(request: Request):
         reviewer(request)
-        return {"tasks": request.app.state.store.tasks()}
+        return {"tasks": [task for task in request.app.state.store.tasks()
+                          if task.get("scope") != "operational" or request.app.state.settings.operational_enabled]}
 
     @service.get(API + "/crops/{digest}")
     def crop(request: Request, digest: Digest):
         reviewer(request)
+        if digest not in images and not request.app.state.settings.operational_enabled:
+            raise HTTPException(404, "Recorte indisponível.")
         data = request.app.state.store.image(digest)
         if data is None:
             raise HTTPException(404, "Recorte indisponível.")
@@ -291,6 +310,8 @@ def create_app(settings=None):
         who = reviewer(request)
         same_origin(request)
         task = tasks.get(task_id)
+        if task is None and request.app.state.settings.operational_enabled:
+            task = request.app.state.store.task(task_id)
         if task is None or task["version"] != payload.version:
             raise HTTPException(409, "Tarefa ou versão indisponível.")
         try:
@@ -304,6 +325,18 @@ def create_app(settings=None):
     def publish(request: Request, task_id: str, payload: Publish):
         store = desktop(request)
         task = tasks.get(task_id)
+        if payload.operational:
+            spec = payload.operational
+            if task or not request.app.state.settings.operational_enabled or not re.fullmatch(r"op-[a-f0-9]{64}", task_id):
+                raise HTTPException(403, "Envio operacional indisponível.")
+            slots = [card.id for card in spec.cards]
+            if (spec.kind == "cell" and (slots != ["cell"] or spec.field not in NUMERIC_CELLS) or
+                    spec.kind == "time" and (set(slots) - {"m1", "m2"} or len(set(slots)) != len(slots)
+                                             or spec.field not in {"Inicio", "Fim"})):
+                raise HTTPException(422, "O lote aceita somente horários de OCR e células numéricas.")
+            labels = {"m1": "Mergulhador 1", "m2": "Mergulhador 2", "cell": "Célula sinalizada"}
+            cards = [dict(card.model_dump(), label=labels[card.id], raw="", required=True) for card in spec.cards]
+            task = operational_task(task_id, spec.kind, spec.field, f"Caso {spec.number:02d}", cards)
         expected = {card["crop"] for card in task["cards"]} if task else set()
         if not task or task["version"] != payload.version or set(payload.crops) != expected:
             raise HTTPException(422, "Este piloto aceita apenas tarefas fictícias fornecidas com a aplicação.")
@@ -311,9 +344,12 @@ def create_app(settings=None):
             uploaded = {digest: b64decode(content, validate=True) for digest, content in payload.crops.items()}
         except ValueError:
             raise HTTPException(422, "Recorte de teste inválido.") from None
-        if any(data != images[digest] for digest, data in uploaded.items()):
+        if payload.operational:
+            if any(not crop_png(data) or checksum(data) != digest for digest, data in uploaded.items()):
+                raise HTTPException(422, "Recorte inválido ou diferente da evidência publicada.")
+        elif any(data != images[digest] for digest, data in uploaded.items()):
             raise HTTPException(422, "Recorte fora do conjunto fictício.")
-        store.publish(task)
+        store.publish(task, uploaded)
         return {"status": "PUBLISHED"}
 
     @service.get(API + "/sync/reviews")

@@ -3,9 +3,12 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import struct
 
 
 API = "/api/review/v1"
+MAX_CROP = 160_000
+NUMERIC_CELLS = {"Profundidade_Max_m", "Tempo_Fundo_min"}
 FIXTURES = Path(__file__).with_name("fixtures")
 SPECS = (
     ("horario-1", "time", "Inicio", "Início · primeiro mergulho", (
@@ -31,6 +34,21 @@ def checksum(data):
 
 def canonical(data):
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def crop_png(data):
+    if (not 33 <= len(data) <= MAX_CROP or not data.startswith(b"\x89PNG\r\n\x1a\n")
+            or data[8:16] != b"\x00\x00\x00\x0dIHDR"):
+        return False
+    width, height = struct.unpack(">II", data[16:24])
+    return 1 <= width <= 1024 and 1 <= height <= 512
+
+
+def operational_task(key, kind, field, label, cards):
+    title = {"Inicio": "Início", "Fim": "Fim", "Profundidade_Max_m": "Profundidade máxima (m)",
+             "Tempo_Fundo_min": "Tempo de fundo (min)"}[field]
+    task = dict(id=key, scope="operational", kind=kind, field=field, title=f"{title} · {label}", cards=cards)
+    return dict(task, version=checksum(canonical(task).encode()))
 
 
 def pilot_fixture():
@@ -63,7 +81,7 @@ def validate_entries(task, entries):
         elif state == "READABLE":
             if not literal or not value or any(ord(character) < 32 for character in literal):
                 raise ValueError("Preencha a transcrição literal e o valor operacional.")
-            if task["kind"] == "time":
+            if task["field"] in {"Inicio", "Fim"}:
                 if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
                     raise ValueError("Use um horário válido em HH:MM.")
             elif task["field"] == "Profundidade_Max_m":

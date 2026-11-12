@@ -7,6 +7,7 @@ let selected = '';
 let active = false;
 let saving = false;
 let loading = false;
+let scopeChosen = false;
 const statusText = {
   SAVED: 'Salvo na web',
   APPLIED: 'Aplicado no desktop',
@@ -83,7 +84,10 @@ function cardView(card, task, parent, actionButtons) {
   const image = node('img', '', evidence);
   image.src = `${api}/crops/${card.crop}`;
   image.alt = `Recorte de ${card.label}`;
-  node('p', `OCR ${card.raw || 'sem leitura'} · Valor interpretado ${card.value || '—'}`, box, 'ocr');
+  const reading = task.scope === 'operational'
+    ? `Valor interpretado ${card.value || '—'}`
+    : `OCR ${card.raw || 'sem leitura'} · Valor interpretado ${card.value || '—'}`;
+  if (task.scope !== 'operational' || card.value) node('p', reading, box, 'ocr');
   const reviewed = task.reviews[card.id];
   if (reviewed) {
     node('p', statusText[reviewed.status], box, `status ${reviewed.status.toLowerCase()}`);
@@ -149,20 +153,31 @@ function category(review) {
 }
 
 function visibleTasks() {
-  return tasks.filter(task => (!$('kind').value || task.kind === $('kind').value) &&
+  return scopedTasks().filter(task => (!$('kind').value || task.kind === $('kind').value) &&
     (!$('field').value || task.field === $('field').value) &&
     ($('filter-state').value === 'all' ||
       task.cards.some(card => category(task.reviews[card.id]) === $('filter-state').value)));
 }
 
+function scopedTasks() {
+  return tasks.filter(task => (task.scope || 'demo') === $('scope').value);
+}
+
 function render() {
+  const hasOperational = tasks.some(task => task.scope === 'operational');
+  $('scope').options[1].disabled = !hasOperational;
+  if (!hasOperational) $('scope').value = 'demo';
+  else if (!scopeChosen) {
+    $('scope').value = 'operational';
+    scopeChosen = true;
+  }
   const counts = {open: 0, saved: 0, applied: 0, conflict: 0};
-  for (const task of tasks) {
+  for (const task of scopedTasks()) {
     for (const card of task.cards) counts[category(task.reviews[card.id])]++;
   }
   for (const [key, count] of Object.entries(counts)) $(`count-${key}`).textContent = count;
-  const fields = new Map(tasks.filter(task => !$('kind').value || task.kind === $('kind').value)
-    .map(task => [task.field, task.title]));
+  const fields = new Map(scopedTasks().filter(task => !$('kind').value || task.kind === $('kind').value)
+    .map(task => [task.field, task.title.split(' · ')[0]]));
   const field = $('field').value;
   $('field').replaceChildren(new Option('Todos os campos', ''), ...[...fields].map(([id, name]) => new Option(name, id)));
   $('field').value = fields.has(field) ? field : '';
@@ -238,7 +253,7 @@ async function refresh(showFeedback = false) {
   }
 }
 
-for (const id of ['kind', 'field', 'filter-state']) $(id).onchange = render;
+for (const id of ['scope', 'kind', 'field', 'filter-state']) $(id).onchange = render;
 $('refresh').onclick = () => refresh(true);
 $('logout').onclick = async () => {
   try {

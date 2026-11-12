@@ -22,7 +22,7 @@
     <div class="intro">
       <div>
         <h1>Julgamento de OCR</h1>
-        <p>Piloto com recortes fictícios.</p>
+        <p>Confira os recortes e registre o julgamento.</p>
       </div>
       <button id="refresh" class="secondary" type="button" hidden>Atualizar fila</button>
     </div>
@@ -40,6 +40,9 @@
         <div><strong id="count-conflict">0</strong><span>Para conferência</span></div>
       </div>
       <div class="filters">
+        <label>Lote<select id="scope">
+          <option value="demo">Demonstração</option><option value="operational">Teste operacional</option>
+        </select></label>
         <label>Tipo<select id="kind">
           <option value="">Todos os tipos</option><option value="time">Horários</option><option value="cell">Células do Excel</option>
         </select></label>
