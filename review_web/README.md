@@ -13,7 +13,7 @@ O piloto inclui quatro tarefas fictícias com seis recortes. A revisão de horá
 | --- | --- |
 | `REVIEW_GOOGLE_ID` | ID do cliente OAuth web |
 | `REVIEW_GOOGLE_SECRET` | Segredo do cliente OAuth web |
-| `REVIEW_GOOGLE_REVIEWERS` | JSON com e-mails em minúsculas e nomes de exibição, como `{"revisor@gmail.com":"Revisor de teste"}` |
+| `REVIEW_GOOGLE_REVIEWERS` | JSON fornecido pelo assistente local, com o identificador Google e o nome de exibição do revisor |
 | `REVIEW_DRIVE_FOLDER_ID` | ID da pasta dedicada que a configuração criou no Drive |
 | `REVIEW_DRIVE_REFRESH_TOKEN` | Credencial de gravação fornecida pela configuração local |
 | `REVIEW_DESKTOP_TOKEN` | Credencial exclusiva para configurar no desktop |

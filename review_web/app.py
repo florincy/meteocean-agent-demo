@@ -165,7 +165,8 @@ def create_app(settings=None):
 
     def reviewer(request):
         identity = read_cookie(request, SESSION, 28800)
-        name = request.app.state.settings.reviewers.get(identity.get("email"))
+        allowed = request.app.state.settings.reviewers
+        name = allowed.get(identity.get("sub")) or allowed.get(identity.get("email"))
         if not name or not identity.get("sub"):
             raise HTTPException(401, "Entre com uma conta autorizada.")
         return dict(id=identity["sub"], name=name)
@@ -250,13 +251,14 @@ def create_app(settings=None):
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             raise HTTPException(401, "Não foi possível validar a conta Google.") from None
         email = str(claims.get("email", "")).lower()
-        if (email not in config.reviewers or claims.get("email_verified") is not True or
-                claims.get("nonce") != pending["nonce"] or not claims.get("sub") or
-                not (email.endswith("@gmail.com") or claims.get("hd"))):
+        subject = claims.get("sub")
+        email_allowed = email in config.reviewers and (email.endswith("@gmail.com") or claims.get("hd"))
+        if (not (subject in config.reviewers or email_allowed) or claims.get("email_verified") is not True
+                or claims.get("nonce") != pending["nonce"] or not subject):
             response = JSONResponse({"detail": "Conta Google fora da lista autorizada."}, status_code=403)
         else:
             response = RedirectResponse("/", status_code=303)
-            set_cookie(request, response, SESSION, dict(sub=claims["sub"], email=email), 28800)
+            set_cookie(request, response, SESSION, dict(sub=subject, email=email if email_allowed else ""), 28800)
         response.delete_cookie(LOGIN)
         return response
 
