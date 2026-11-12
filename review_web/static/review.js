@@ -69,6 +69,39 @@ function textInput(label, parent, draft, key, options = {}) {
   return item;
 }
 
+function timeDigits(value) {
+  return value.replace(/[^0-9]/g, '');
+}
+
+function formatTime(value, complete = false) {
+  const singleHour = value.trim().match(/^([0-9])\s*[:.,hH]\s*([0-9]{2})$/);
+  let digits = singleHour ? `0${singleHour[1]}${singleHour[2]}` : timeDigits(value).slice(0, 4);
+  if (complete && digits.length === 3 && Number(digits.slice(1)) < 60) digits = `0${digits}`;
+  return digits.length < 2 ? digits : `${digits.slice(0, 2)}:${digits.slice(2)}`;
+}
+
+function timeInput(label, parent, draft) {
+  const item = textInput(label, parent, draft, 'operational_value', {placeholder: 'HH:MM', inputMode: 'numeric'});
+  item.oninput = event => {
+    let value = item.value;
+    let position = timeDigits(value.slice(0, item.selectionStart)).length;
+    if (event.inputType?.startsWith('delete') && draft.operational_value.includes(':') &&
+        !value.includes(':') && value === timeDigits(draft.operational_value)) {
+      if (event.inputType === 'deleteContentBackward') position--;
+      value = value.slice(0, position) + value.slice(position + 1);
+    }
+    const formatted = formatTime(value);
+    if (formatted !== item.value) {
+      item.value = formatted;
+      const cursor = Math.min(formatted.length, position + Number(position >= 2));
+      item.setSelectionRange(cursor, cursor);
+    }
+    draft.operational_value = item.value;
+  };
+  item.onblur = () => { item.value = draft.operational_value = formatTime(item.value, true); };
+  return item;
+}
+
 function zoom(card) {
   $('zoom-label').textContent = card.label;
   $('zoom-image').src = `${api}/crops/${card.crop}`;
@@ -106,8 +139,8 @@ function cardView(card, task, parent, actionButtons) {
   judgment.value = draft.state;
   const isTime = task.kind === 'time';
   const literal = textInput('Transcrição literal', fields, draft, 'transcription');
-  const operational = textInput('Valor operacional', fields, draft, 'operational_value',
-    isTime ? {placeholder: 'HH:MM'} : {inputMode: 'decimal'});
+  const operational = isTime ? timeInput('Valor operacional', fields, draft)
+    : textInput('Valor operacional', fields, draft, 'operational_value', {inputMode: 'decimal'});
   const change = () => {
     draft.state = judgment.value;
     literal.disabled = operational.disabled = draft.state !== 'READABLE';
@@ -140,8 +173,7 @@ function taskView(task, parent) {
   if (canPair) {
     const group = node('div', '', header, 'group-actions');
     if (!drafts.has(task.id)) drafts.set(task.id, {operational_value: ''});
-    common = textInput('Horário comum', group, drafts.get(task.id), 'operational_value',
-      {placeholder: 'HH:MM', inputMode: 'numeric'});
+    common = timeInput('Horário comum', group, drafts.get(task.id));
     pairButton = button('Salvar para os dois', group, null, 'primary');
     actions.push(pairButton);
     pairFeedback = node('p', '', group, 'save-feedback');
