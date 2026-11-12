@@ -113,7 +113,7 @@ class ReviewStore:
         self.images = images
         self.lock = threading.RLock()
 
-    def state(self):
+    def state(self, *, resolve_conflicts=True):
         tasks, decisions, acknowledgements = {}, {}, {}
         for event in sorted(self.journal.read(), key=lambda item: (item["at"], item["id"])):
             kind, data = event["kind"], event["data"]
@@ -128,6 +128,8 @@ class ReviewStore:
         for operation, result in acknowledgements.items():
             if operation in decisions:
                 decisions[operation].update(result)
+        if not resolve_conflicts:
+            return tasks, decisions
         # Two deployments can briefly overlap. Keep both entries in the journal
         # and withhold competing reviews until the desktop has an unambiguous result.
         claims = {}
@@ -200,10 +202,11 @@ class ReviewStore:
     def acknowledge(self, operation, status, reason):
         result = dict(status=status, reason=reason)
         with self.lock:
-            _, decisions = self.state()
+            _, decisions = self.state(resolve_conflicts=False)
             previous = decisions.get(operation)
             if previous and all(previous[key] == value for key, value in result.items()):
                 return
             if not previous or previous["status"] not in {"SAVED", "WAITING_EXCEL"}:
                 raise Conflict("Revisão inexistente ou já encerrada com outro resultado.")
             self.record("ack", operation, result)
+
