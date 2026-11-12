@@ -319,7 +319,7 @@ def create_app(settings=None):
         except ValueError as error:
             raise HTTPException(422, str(error)) from None
         saved = request.app.state.store.save(task, payload.generation, str(payload.id), entries, who)
-        return {"status": saved["status"]}
+        return {"status": saved["status"], "entries": saved["entries"]}
 
     @service.put(API + "/sync/tasks/{task_id}")
     def publish(request: Request, task_id: str, payload: Publish):

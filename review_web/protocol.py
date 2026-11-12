@@ -66,6 +66,20 @@ def pilot_fixture():
     return tasks, images
 
 
+def normalize_time(value):
+    text = value.strip()
+    match = re.fullmatch(r"([0-9]{1,2})\s*[:.,hH]\s*([0-9]{2})", text)
+    if match:
+        hour, minute = map(int, match.groups())
+    elif re.fullmatch(r"[0-9]{3,4}", text):
+        hour, minute = int(text[:-2]), int(text[-2:])
+    else:
+        raise ValueError("Informe um horário válido, como 08:00 ou 0800.")
+    if hour > 23 or minute > 59:
+        raise ValueError("Informe um horário válido, como 08:00 ou 0800.")
+    return f"{hour:02d}:{minute:02d}"
+
+
 def validate_entries(task, entries):
     slots = {card["id"] for card in task["cards"]}
     if not entries or set(entries) - slots:
@@ -82,8 +96,7 @@ def validate_entries(task, entries):
             if not literal or not value or any(ord(character) < 32 for character in literal):
                 raise ValueError("Preencha a transcrição literal e o valor operacional.")
             if task["field"] in {"Inicio", "Fim"}:
-                if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
-                    raise ValueError("Use um horário válido em HH:MM.")
+                value = normalize_time(value)
             elif task["field"] == "Profundidade_Max_m":
                 if not re.fullmatch(r"[0-9]{1,6}(?:[.,][0-9]{1,3})?", value):
                     raise ValueError("Informe a profundidade em metros, com ponto ou vírgula decimal.")

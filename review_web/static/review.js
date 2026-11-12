@@ -114,8 +114,12 @@ function cardView(card, task, parent, actionButtons) {
   };
   judgment.onchange = change;
   change();
+  const feedback = node('p', '', box, 'save-feedback');
+  feedback.setAttribute('role', 'status');
   actionButtons.push(button(isTime ? 'Salvar individual' : 'Salvar célula', box,
-    () => submit(task, {[card.id]: entry(draft)}, actionButtons), isTime ? 'secondary save' : 'primary save'));
+    () => submit(task, {[card.id]: entry(draft)}, actionButtons, feedback),
+    isTime ? 'secondary save' : 'primary save'));
+  return {judgment, literal};
 }
 
 function entry(draft, common = draft.operational_value) {
@@ -132,18 +136,48 @@ function taskView(task, parent) {
   node('h2', task.title, header);
   const actions = [];
   const canPair = task.kind === 'time' && task.cards.length === 2 && Object.keys(task.reviews).length === 0;
+  let common, pairFeedback, pairButton;
   if (canPair) {
     const group = node('div', '', header, 'group-actions');
     if (!drafts.has(task.id)) drafts.set(task.id, {operational_value: ''});
-    const common = textInput('Horário comum', group, drafts.get(task.id), 'operational_value', {placeholder: 'HH:MM'});
-    actions.push(button('Salvar para os dois', group, () => {
-      const entries = Object.fromEntries(task.cards.map(card => [card.id, entry(editorDraft(task, card), common.value)]));
-      submit(task, entries, actions);
-    }, 'primary'));
-    node('p', 'Se os recortes mostram o mesmo horário, informe o horário comum e transcreva cada recorte.', block, 'task-hint');
+    common = textInput('Horário comum', group, drafts.get(task.id), 'operational_value',
+      {placeholder: 'HH:MM', inputMode: 'numeric'});
+    pairButton = button('Salvar para os dois', group, null, 'primary');
+    actions.push(pairButton);
+    pairFeedback = node('p', '', group, 'save-feedback');
+    pairFeedback.setAttribute('role', 'status');
+    node('p', 'Para salvar juntos, preencha o horário comum e a transcrição de cada recorte. Use os valores individuais para salvar separadamente.', block, 'task-hint');
   }
   const cards = node('div', '', block, 'cards');
-  for (const card of task.cards) cardView(card, task, cards, actions);
+  const controls = task.cards.map(card => cardView(card, task, cards, actions));
+  if (canPair) {
+    const showMissing = (control, message) => {
+      pairFeedback.textContent = message;
+      control.setCustomValidity(message);
+      control.reportValidity();
+      control.setCustomValidity('');
+    };
+    pairButton.onclick = () => {
+      if (!common.value.trim()) {
+        showMissing(common, 'Informe o horário comum dos dois mergulhadores.');
+        return;
+      }
+      const unreadable = controls.findIndex(control => control.judgment.value !== 'READABLE');
+      if (unreadable !== -1) {
+        showMissing(controls[unreadable].judgment, 'Para salvar juntos, os dois recortes precisam estar legíveis.');
+        return;
+      }
+      const missing = controls.findIndex(control => !control.literal.value.trim());
+      if (missing !== -1) {
+        showMissing(controls[missing].literal, `Preencha a transcrição do ${task.cards[missing].label.toLowerCase()}.`);
+        return;
+      }
+      const entries = Object.fromEntries(task.cards.map((card, index) => [
+        card.id, {state: 'READABLE', transcription: controls[index].literal.value, operational_value: common.value},
+      ]));
+      submit(task, entries, actions, pairFeedback);
+    };
+  }
 }
 
 function category(review) {
@@ -200,22 +234,32 @@ function render() {
   taskView(matches[index], workbench);
 }
 
-async function submit(task, entries, buttons) {
+function operationId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+}
+
+async function submit(task, entries, buttons, feedback) {
   if (saving) return;
   const body = {version: task.version, generation: task.generation, entries};
   const fingerprint = JSON.stringify(body);
   const previous = deliveries.get(task.id);
-  const id = previous?.fingerprint === fingerprint ? previous.id : crypto.randomUUID();
-  deliveries.set(task.id, {id, fingerprint});
   saving = true;
   buttons.forEach(item => { item.disabled = true; });
-  $('notice').textContent = 'Salvando…';
+  $('notice').textContent = '';
+  feedback.textContent = 'Salvando…';
   try {
+    const id = previous?.fingerprint === fingerprint ? previous.id : operationId();
+    deliveries.set(task.id, {id, fingerprint});
     const result = await request(`/tasks/${task.id}/reviews`, {...body, id});
     const previousList = visibleTasks();
     const index = previousList.findIndex(item => item.id === task.id);
     task.generation += 1;
-    for (const [slot, review] of Object.entries(entries)) {
+    for (const [slot, review] of Object.entries(result.entries)) {
       task.reviews[slot] = {...review, status: result.status};
       drafts.delete(`${task.id}/${slot}`);
     }
@@ -223,8 +267,9 @@ async function submit(task, entries, buttons) {
     if (!visibleTasks().some(item => item.id === task.id)) selected = previousList[index + 1]?.id || '';
     render();
     $('notice').textContent = `${statusText[result.status]} · ${task.title}`;
+    $('notice').scrollIntoView({block: 'nearest'});
   } catch (error) {
-    $('notice').textContent = error.status ? error.message : 'Conexão interrompida. Seu preenchimento foi mantido. Tente salvar de novo.';
+    feedback.textContent = error.status ? error.message : 'Não foi possível enviar. Seu preenchimento foi mantido. Tente salvar de novo.';
   } finally {
     saving = false;
     buttons.forEach(item => { item.disabled = false; });
