@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Julgamento AlphaDive</title>
+  <link rel="stylesheet" href="/review.css">
+  <script src="/review.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="shell top-content">
+      <div class="wordmark"><span class="mark" aria-hidden="true">AD</span><strong>AlphaDive</strong></div>
+      <div id="account" class="account" hidden>
+        <span id="reviewer"></span>
+        <button id="logout" class="ghost" type="button">Sair</button>
+      </div>
+    </div>
+  </header>
+  <main class="shell">
+    <div class="intro">
+      <div>
+        <h1>Julgamento de OCR</h1>
+        <p>Piloto com recortes fictícios.</p>
+      </div>
+      <button id="refresh" class="secondary" type="button" hidden>Atualizar fila</button>
+    </div>
+    <p id="notice" role="status">Carregando a fila…</p>
+    <section id="sign-in" class="surface sign-in" hidden>
+      <h2>Entre para revisar</h2>
+      <p>Use a conta Google autorizada para este piloto.</p>
+      <a class="primary" href="/auth/google">Entrar com Google</a>
+    </section>
+    <div id="queue" hidden>
+      <div class="queue-summary" aria-label="Estado da fila">
+        <div><strong id="count-open">0</strong><span>Em aberto</span></div>
+        <div><strong id="count-saved">0</strong><span>Aguardando desktop</span></div>
+        <div><strong id="count-applied">0</strong><span>Aplicados</span></div>
+        <div><strong id="count-conflict">0</strong><span>Para conferência</span></div>
+      </div>
+      <div class="filters">
+        <label>Tipo<select id="kind">
+          <option value="">Todos os tipos</option><option value="time">Horários</option><option value="cell">Células do Excel</option>
+        </select></label>
+        <label>Campo<select id="field"><option value="">Todos os campos</option></select></label>
+        <label>Estado<select id="filter-state">
+          <option value="open">Em aberto</option><option value="all">Todos</option>
+          <option value="saved">Aguardando desktop</option><option value="conflict">Para conferência</option>
+        </select></label>
+      </div>
+      <div id="workbench"></div>
+    </div>
+  </main>
+  <dialog id="zoom">
+    <div class="zoom-title"><strong id="zoom-label"></strong><form method="dialog"><button class="secondary">Fechar</button></form></div>
+    <img id="zoom-image" alt="">
+  </dialog>
+</body>
+</html>

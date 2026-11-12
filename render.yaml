@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: alphadive-julgamento-piloto
+    runtime: python
+    region: virginia
+    plan: free
+    autoDeployTrigger: "off"
+    buildCommand: pip install -r review_web/requirements.txt
+    startCommand: uvicorn review_web.app:app --host 0.0.0.0 --port $PORT --no-access-log
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.14"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: alphadive-julgamento-piloto-db
+          property: connectionString
+      - key: REVIEW_SESSION_SECRET
+        generateValue: true
+      - key: REVIEW_DESKTOP_TOKEN
+        sync: false
+      - key: REVIEW_GOOGLE_ID
+        sync: false
+      - key: REVIEW_GOOGLE_SECRET
+        sync: false
+      - key: REVIEW_GOOGLE_REVIEWERS
+        sync: false
+databases:
+  - name: alphadive-julgamento-piloto-db
+    plan: free
+    region: virginia
+    ipAllowList: []
