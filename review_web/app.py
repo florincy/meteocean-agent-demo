@@ -6,6 +6,7 @@ from hmac import compare_digest
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 from typing import Annotated, Literal
 from urllib.parse import urlencode, urlsplit
@@ -18,7 +19,7 @@ from itsdangerous import BadData, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .protocol import API, checksum, pilot_fixture, validate_entries
-from .store import Conflict, ReviewStore
+from .store import Conflict, DriveJournal, LocalJournal, ReviewStore
 
 
 STATIC = Path(__file__).with_name("static")
@@ -30,23 +31,27 @@ Digest = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 @dataclass(frozen=True)
 class Settings:
     origin: str
-    database: str
+    journal_dir: str
     secret: str
     desktop_token: str
     google_id: str
     google_secret: str
     reviewers: dict
+    drive_folder: str = ""
+    drive_refresh_token: str = ""
 
     @classmethod
     def from_env(cls):
         return cls(
             (os.environ.get("REVIEW_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/"),
-            os.environ.get("DATABASE_URL", ""),
+            os.environ.get("REVIEW_LOCAL_JOURNAL", ""),
             os.environ.get("REVIEW_SESSION_SECRET", ""),
             os.environ.get("REVIEW_DESKTOP_TOKEN", ""),
             os.environ.get("REVIEW_GOOGLE_ID", ""),
             os.environ.get("REVIEW_GOOGLE_SECRET", ""),
             json.loads(os.environ.get("REVIEW_GOOGLE_REVIEWERS", "{}")),
+            os.environ.get("REVIEW_DRIVE_FOLDER_ID", ""),
+            os.environ.get("REVIEW_DRIVE_REFRESH_TOKEN", ""),
         )
 
     def validate(self):
@@ -58,11 +63,14 @@ class Settings:
             and not os.getenv("RENDER")
         ):
             raise ValueError("Use HTTPS para o serviço publicado.")
-        if (min(len(self.secret), len(self.desktop_token)) < 32 or self.secret == self.desktop_token
-                or not self.database):
-            raise ValueError("Configure o banco e dois segredos independentes de pelo menos 32 caracteres.")
-        if os.getenv("RENDER") and not self.database.startswith(("postgres://", "postgresql://")):
-            raise ValueError("Configure Render Postgres para o piloto publicado.")
+        if min(len(self.secret), len(self.desktop_token)) < 32 or self.secret == self.desktop_token:
+            raise ValueError("Configure dois segredos independentes de pelo menos 32 caracteres.")
+        if self.drive_folder or self.drive_refresh_token or os.getenv("RENDER"):
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{10,128}", self.drive_folder)
+                    or not all((self.drive_refresh_token, self.google_id, self.google_secret))):
+                raise ValueError("Configure a pasta dedicada e a credencial de gravação do Google Drive.")
+        elif not self.journal_dir:
+            raise ValueError("Configure uma pasta de arquivos JSON para o teste local.")
         if not isinstance(self.reviewers, dict) or any(
             not isinstance(email, str) or email != email.lower() or
             not isinstance(name, str) or not 0 < len(name.strip()) <= 120
@@ -130,9 +138,15 @@ def create_app(settings=None):
         config = settings or Settings.from_env()
         config.validate()
         service.state.settings = config
-        service.state.store = ReviewStore(config.database)
-        service.state.store.initialize()
-        yield
+        journal = (DriveJournal(config.drive_folder, config.google_id, config.google_secret, config.drive_refresh_token)
+                   if config.drive_folder else LocalJournal(config.journal_dir))
+        service.state.store = ReviewStore(journal, images)
+        try:
+            journal.initialize()
+            yield
+        finally:
+            if isinstance(journal, DriveJournal):
+                journal.client.close()
 
     service = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -189,9 +203,12 @@ def create_app(settings=None):
     async def conflict_response(_, error):
         return JSONResponse({"detail": str(error)}, status_code=409)
 
+    @service.exception_handler(httpx.HTTPError)
+    async def drive_error(_, error):
+        return JSONResponse({"detail": "O Google Drive está indisponível. Tente novamente."}, status_code=503)
+
     @service.get("/healthz")
-    def health(request: Request):
-        request.app.state.store.ping()
+    def health():
         return {"status": "ok"}
 
     @service.get("/")
@@ -294,7 +311,7 @@ def create_app(settings=None):
             raise HTTPException(422, "Recorte de teste inválido.") from None
         if any(data != images[digest] for digest, data in uploaded.items()):
             raise HTTPException(422, "Recorte fora do conjunto fictício.")
-        store.publish(task, uploaded)
+        store.publish(task)
         return {"status": "PUBLISHED"}
 
     @service.get(API + "/sync/reviews")

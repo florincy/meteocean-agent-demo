@@ -1,10 +1,19 @@
-"""Persistent queue and acknowledgements. SQLite is used for local smoke tests."""
-from contextlib import contextmanager
+"""Append-only JSON journal for the review pilot."""
 from datetime import datetime, timezone
 import json
-import sqlite3
+from pathlib import Path
+import threading
+from time import monotonic
+from uuid import uuid4
+
+import httpx
 
 from .protocol import canonical
+
+
+DRIVE_FILES = "https://www.googleapis.com/drive/v3/files"
+DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+DRIVE_TAG = "alphadive-review-pilot-v1"
 
 
 class Conflict(ValueError):
@@ -15,119 +24,186 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-class ReviewStore:
-    def __init__(self, database):
-        self.database = str(database)
-        self.postgres = self.database.startswith(("postgres://", "postgresql://"))
-
-    @contextmanager
-    def transaction(self, *, write=False):
-        if self.postgres:
-            import psycopg
-            connection = psycopg.connect(self.database, connect_timeout=8)
-        else:
-            connection = sqlite3.connect(self.database, timeout=8)
-            connection.execute("PRAGMA foreign_keys=ON")
-        try:
-            if write and not self.postgres:
-                connection.execute("BEGIN IMMEDIATE")
-            yield lambda sql, args=(): connection.execute(sql.replace("?", "%s") if self.postgres else sql, args)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+class LocalJournal:
+    """A filesystem journal used when exercising the service locally."""
+    def __init__(self, path):
+        self.path = Path(path)
 
     def initialize(self):
-        with self.transaction(write=True) as db:
-            db("""CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY, version TEXT NOT NULL, data TEXT NOT NULL,
-                generation INTEGER NOT NULL DEFAULT 0)""")
-            db("""CREATE TABLE IF NOT EXISTS crops (
-                digest TEXT PRIMARY KEY, image BYTEA NOT NULL)""")
-            db("""CREATE TABLE IF NOT EXISTS decisions (
-                id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
-                generation INTEGER NOT NULL, data TEXT NOT NULL, status TEXT NOT NULL,
-                reason TEXT NOT NULL DEFAULT '', UNIQUE(task_id, generation))""")
+        self.path.mkdir(parents=True, exist_ok=True)
 
-    def ping(self):
-        with self.transaction() as db:
-            db("SELECT 1").fetchone()
+    def read(self):
+        return [json.loads(path.read_text(encoding="utf-8")) for path in self.path.glob("*.json")]
 
-    def publish(self, task, images):
-        with self.transaction(write=True) as db:
-            db("INSERT INTO tasks (id,version,data) VALUES (?,?,?) ON CONFLICT (id) DO NOTHING",
-               (task["id"], task["version"], canonical(task)))
-            version, = db("SELECT version FROM tasks WHERE id=?", (task["id"],)).fetchone()
-            if version != task["version"]:
+    def append(self, event):
+        destination = self.path / f"{uuid4().hex}.json"
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_text(canonical(event), encoding="utf-8")
+        temporary.replace(destination)
+
+
+class DriveJournal:
+    def __init__(self, folder, client_id, client_secret, refresh_token):
+        self.folder = folder
+        self.credentials = dict(client_id=client_id, client_secret=client_secret,
+                                refresh_token=refresh_token, grant_type="refresh_token")
+        self.token = ""
+        self.expires = 0
+        self.recent = {}
+        self.client = httpx.Client(timeout=15)
+
+    def request(self, method, url, **kwargs):
+        for attempt in range(2):
+            if monotonic() >= self.expires:
+                response = self.client.post("https://oauth2.googleapis.com/token", data=self.credentials)
+                token = response.raise_for_status().json()
+                self.token = token["access_token"]
+                self.expires = monotonic() + max(0, int(token["expires_in"]) - 60)
+            headers = kwargs.get("headers", {}) | {"Authorization": "Bearer " + self.token}
+            response = self.client.request(method, url, **(kwargs | {"headers": headers}))
+            if response.status_code != 401 or attempt:
+                return response.raise_for_status().json()
+            self.expires = 0
+
+    def initialize(self):
+        folder = self.request("GET", f"{DRIVE_FILES}/{self.folder}", params={
+            "fields": "mimeType,trashed,capabilities(canAddChildren)",
+        })
+        if (folder.get("mimeType") != "application/vnd.google-apps.folder" or folder.get("trashed")
+                or not folder.get("capabilities", {}).get("canAddChildren")):
+            raise ValueError("A pasta de julgamentos do Drive não permite gravar arquivos.")
+
+    def read(self):
+        visible = []
+        params = {
+            "q": f"'{self.folder}' in parents and trashed=false and "
+                 f"appProperties has {{ key='app' and value='{DRIVE_TAG}' }}",
+            "fields": "nextPageToken,files(id,description)",
+            "pageSize": 100,
+        }
+        while True:
+            page = self.request("GET", DRIVE_FILES, params=params)
+            for record in page.get("files", []):
+                visible.append(json.loads(record["description"]))
+                self.recent.pop(record["id"], None)
+            token = page.get("nextPageToken")
+            if not token:
+                return visible + list(self.recent.values())
+            params["pageToken"] = token
+
+    def append(self, event):
+        content = canonical(event)
+        metadata = canonical(dict(name=f"{event['kind']}-{event['id']}.json",
+                                  parents=[self.folder], description=content,
+                                  mimeType="application/json", appProperties={"app": DRIVE_TAG}))
+        boundary = uuid4().hex
+        body = (
+            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n"
+            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{content}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        record = self.request("POST", DRIVE_UPLOAD, params={"uploadType": "multipart", "fields": "id"},
+                              headers={"Content-Type": f"multipart/related; boundary={boundary}"}, content=body)
+        self.recent[record["id"]] = event
+
+
+class ReviewStore:
+    def __init__(self, journal, images):
+        self.journal = journal
+        self.images = images
+        self.lock = threading.RLock()
+
+    def state(self):
+        tasks, decisions, acknowledgements = {}, {}, {}
+        for event in sorted(self.journal.read(), key=lambda item: (item["at"], item["id"])):
+            kind, data = event["kind"], event["data"]
+            if kind == "task":
+                tasks.setdefault(event["id"], data)
+            elif kind == "review":
+                decisions.setdefault(event["id"], dict(data, status="SAVED", reason=""))
+            elif kind == "ack":
+                previous = acknowledgements.get(event["id"])
+                if not previous or previous["status"] == "WAITING_EXCEL":
+                    acknowledgements[event["id"]] = data
+        for operation, result in acknowledgements.items():
+            if operation in decisions:
+                decisions[operation].update(result)
+        # Two deployments can briefly overlap. Keep both entries in the journal
+        # and withhold competing reviews until the desktop has an unambiguous result.
+        claims = {}
+        for review in decisions.values():
+            for slot in review["entries"]:
+                claims.setdefault((review["task_id"], slot), []).append(review)
+        for contenders in claims.values():
+            if len(contenders) > 1:
+                for review in contenders:
+                    if review["status"] in {"SAVED", "WAITING_EXCEL"}:
+                        review.update(status="CONFLICT", reason="SOURCE_CHANGED")
+        return tasks, decisions
+
+    def record(self, kind, key, data):
+        self.journal.append(dict(kind=kind, id=key, data=data, at=timestamp()))
+
+    def publish(self, task):
+        with self.lock:
+            tasks, _ = self.state()
+            previous = tasks.get(task["id"])
+            if previous is None:
+                self.record("task", task["id"], task)
+            elif previous["version"] != task["version"]:
                 raise Conflict("A tarefa tem outra versão publicada.")
-            for digest, content in images.items():
-                db("INSERT INTO crops VALUES (?,?) ON CONFLICT (digest) DO NOTHING", (digest, content))
 
     def image(self, digest):
-        with self.transaction() as db:
-            row = db("SELECT image FROM crops WHERE digest=?", (digest,)).fetchone()
-            return bytes(row[0]) if row else None
+        # The only images accepted by the pilot are the bundled synthetic crops.
+        return self.images.get(digest)
 
     def tasks(self):
-        with self.transaction() as db:
-            rows = db("""SELECT t.data,t.generation,d.data,d.status,d.reason FROM tasks t
-                         LEFT JOIN decisions d ON d.task_id=t.id
-                         ORDER BY t.id,d.generation""").fetchall()
-        tasks = {}
-        for data, generation, decision, status, reason in rows:
-            task = json.loads(data)
-            target = tasks.setdefault(task["id"], dict(task, generation=generation, reviews={}))
-            if decision:
-                record = json.loads(decision)
-                target["reviews"].update({
-                    slot: dict(entry, status=status, reason=reason)
-                    for slot, entry in record["entries"].items()
-                })
-        return list(tasks.values())
+        with self.lock:
+            published, decisions = self.state()
+        tasks = {key: dict(task, generation=0, reviews={}) for key, task in published.items()}
+        for record in decisions.values():
+            task = tasks[record["task_id"]]
+            task["generation"] += 1
+            for slot, entry in record["entries"].items():
+                if task["reviews"].get(slot, {}).get("status") == "APPLIED":
+                    continue
+                task["reviews"][slot] = dict(entry, status=record["status"], reason=record["reason"])
+        return [tasks[key] for key in sorted(tasks)]
 
     def save(self, task, generation, operation, entries, reviewer):
         task_id = task["id"]
         data = dict(id=operation, task_id=task_id, version=task["version"],
                     entries=entries, reviewer=reviewer)
-        with self.transaction(write=True) as db:
-            # Serialize updates on this task on Postgres as well as SQLite.
-            locked = db("UPDATE tasks SET generation=generation WHERE id=? AND version=?",
-                        (task_id, task["version"])).rowcount
-            if not locked:
+        with self.lock:
+            tasks, decisions = self.state()
+            if tasks.get(task_id, {}).get("version") != task["version"]:
                 raise Conflict("A versão da tarefa mudou. Atualize a fila.")
-            saved = db("SELECT data,status,reason FROM decisions WHERE id=?", (operation,)).fetchone()
-            if saved:
-                existing = json.loads(saved[0])
+            existing = decisions.get(operation)
+            if existing:
                 if any(existing[key] != value for key, value in data.items()):
                     raise Conflict("Este envio já foi usado com outros dados.")
-                return dict(existing, status=saved[1], reason=saved[2])
-            current, = db("SELECT generation FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if current != generation:
+                return existing
+            related = [review for review in decisions.values() if review["task_id"] == task_id]
+            if len(related) != generation:
                 raise Conflict("Outro julgamento já chegou para este bloco. Atualize a fila.")
-            rows = db("SELECT data FROM decisions WHERE task_id=?", (task_id,)).fetchall()
-            if any(set(entries) & json.loads(row[0])["entries"].keys() for row in rows):
+            if any(set(entries) & review["entries"].keys() for review in related):
                 raise Conflict("O recorte já foi julgado.")
             data["reviewed_at"] = timestamp()
-            inserted = db("""INSERT INTO decisions (id,task_id,generation,data,status) VALUES (?,?,?,?,?)
-                             ON CONFLICT (id) DO NOTHING""",
-                          (operation, task_id, generation + 1, canonical(data), "SAVED")).rowcount
-            if not inserted:
-                raise Conflict("Este envio já foi usado com outra tarefa.")
-            db("UPDATE tasks SET generation=? WHERE id=?", (generation + 1, task_id))
+            self.record("review", operation, data)
         return dict(data, status="SAVED", reason="")
 
     def pending(self):
-        with self.transaction() as db:
-            rows = db("""SELECT data,status,reason FROM decisions WHERE status IN ('SAVED','WAITING_EXCEL')
-                         ORDER BY task_id,generation""").fetchall()
-        return [dict(json.loads(data), status=status, reason=reason) for data, status, reason in rows]
+        with self.lock:
+            _, decisions = self.state()
+        return [record for record in decisions.values() if record["status"] in {"SAVED", "WAITING_EXCEL"}]
 
     def acknowledge(self, operation, status, reason):
-        with self.transaction(write=True) as db:
-            count = db("""UPDATE decisions SET status=?,reason=? WHERE id=?
-                          AND (status IN ('SAVED','WAITING_EXCEL') OR (status=? AND reason=?))""",
-                       (status, reason, operation, status, reason)).rowcount
-            if not count:
+        result = dict(status=status, reason=reason)
+        with self.lock:
+            _, decisions = self.state()
+            previous = decisions.get(operation)
+            if previous and all(previous[key] == value for key, value in result.items()):
+                return
+            if not previous or previous["status"] not in {"SAVED", "WAITING_EXCEL"}:
                 raise Conflict("Revisão inexistente ou já encerrada com outro resultado.")
+            self.record("ack", operation, result)
